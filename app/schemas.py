@@ -1,6 +1,6 @@
 # app/schemas.py
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Any
 
 # --- Steps ---
 
@@ -8,6 +8,8 @@ from typing import List, Optional
 class StepCreate(BaseModel):
     selector: str
     instruction: str
+    action: Optional[str] = None
+    target: Optional[Any] = None
     # base64 PNG (will be optional)
     screenshot: Optional[str] = None
 
@@ -19,6 +21,8 @@ class Step(BaseModel):
     guide_id: int
     selector: str
     instruction: str
+    action: Optional[str] = None
+    target: Optional[Any] = None
     # we expose path as-is for now; you can later convert to URL if you want
     screenshot_path: Optional[str] = None
 
