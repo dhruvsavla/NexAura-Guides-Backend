@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status,Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
-from typing import List
+from typing import List, Dict, Any
 from io import BytesIO
 import base64
 import os
@@ -15,6 +15,8 @@ from reportlab.pdfgen import canvas
 
 from .. import database, models, auth
 from ..schemas import GuideCreate, Guide
+import json
+from fastapi import BackgroundTasks
 
 router = APIRouter()
 
@@ -267,6 +269,8 @@ async def create_guide(
         guide_dir = SCREENSHOT_ROOT / f"guide_{db_guide.id}"
         guide_dir.mkdir(parents=True, exist_ok=True)
 
+        rich_steps_payload: Dict[int, Dict[str, Any]] = {}
+
         for i, step_data in enumerate(guide.steps):
             screenshot_path_str = None
 
@@ -347,8 +351,21 @@ async def create_guide(
             )
             db.add(db_step)
 
+            rich_steps_payload[i + 1] = {
+                "action": step_data.action or None,
+                "target": step_data.target or None,
+            }
+
         db.commit()
         db.refresh(db_guide)
+
+        # Persist rich step metadata separately (does not touch DB schema)
+        try:
+            rich_file = guide_dir / "rich_steps.json"
+            with open(rich_file, "w", encoding="utf-8") as f:
+                json.dump(rich_steps_payload, f)
+        except Exception as e:
+            print("Warning: failed to persist rich step metadata", e)
         return db_guide
 
     except Exception as e:
@@ -364,9 +381,45 @@ async def get_user_guides(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
-    return (
+    user = (
         db.query(models.User)
         .filter(models.User.id == current_user.id)
         .first()
-        .guides
     )
+    guides = user.guides if user else []
+    for g in guides:
+        try:
+            enriched = hydrate_rich_steps(g)
+            if enriched:
+                g.steps = enriched
+        except Exception:
+            continue
+    return guides
+
+
+def hydrate_rich_steps(guide: models.Guide):
+    if not guide or not guide.id:
+        return guide.steps
+    guide_dir = SCREENSHOT_ROOT / f"guide_{guide.id}"
+    rich_file = guide_dir / "rich_steps.json"
+    if not rich_file.exists():
+        return guide.steps
+    try:
+        with open(rich_file, "r", encoding="utf-8") as f:
+            rich_map = json.load(f)
+    except Exception:
+        return guide.steps
+
+    steps = guide.steps or []
+    for step in steps:
+        try:
+            payload = rich_map.get(str(step.step_number)) or rich_map.get(step.step_number)
+            if not payload:
+                continue
+            if "action" in payload:
+                step.action = payload.get("action")
+            if "target" in payload:
+                step.target = payload.get("target")
+        except Exception:
+            continue
+    return steps

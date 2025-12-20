@@ -2,7 +2,7 @@ aiofiles==25.1.0
 annotated-doc==0.0.3
 annotated-types==0.7.0
 anyio==4.11.0
-bcrypt==5.0.0
+bcrypt>=4.1.2
 cachetools==6.2.1
 certifi==2025.10.5
 cffi==2.0.0

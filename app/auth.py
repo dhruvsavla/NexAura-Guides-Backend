@@ -2,12 +2,12 @@
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import os
 import hashlib
+import bcrypt
 from . import models, database
 
 # --- Config ---
@@ -15,7 +15,6 @@ SECRET_KEY = os.getenv("SECRET_KEY", "your_fallback_secret_key_here")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/token")
 
 
@@ -33,14 +32,15 @@ def _prepare_password(password: str) -> str:
 
 
 def verify_password(plain_password, hashed_password):
-    prepared = _prepare_password(plain_password)
-    return pwd_context.verify(prepared, hashed_password)
-
+    if hashed_password is None:
+        return False
+    return bcrypt.checkpw(
+        plain_password.encode("utf-8"),
+        hashed_password.encode("utf-8"),
+    )
 
 def get_password_hash(password):
-    prepared = _prepare_password(password)
-    return pwd_context.hash(prepared)
-
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 # --- JWT Token Functions ---
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
@@ -74,5 +74,4 @@ async def get_current_user(
     user = db.query(models.User).filter(models.User.email == token_data.email).first()
     if user is None:
         raise credentials_exception
-
     return user
