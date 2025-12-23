@@ -1,5 +1,5 @@
 # app/routes/guides.py
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status,Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -8,6 +8,7 @@ from io import BytesIO
 import base64
 import os
 from pathlib import Path
+from PIL import Image, ImageDraw
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -136,6 +137,36 @@ async def export_guide_pdf(
                         mask="auto",
                     )
                     margin_top -= (img_height + 10)
+                    print("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&helllllooooo----------------------------------------------------")
+                    # DRAW HIGHLIGHT IF PRESENT
+                    # if (
+                    #     step.highlight_x is not None
+                    #     and step.highlight_y is not None
+                    #     and step.highlight_width is not None
+                    #     and step.highlight_height is not None
+                    # ):
+                    #     pdf.setFillColorRGB(1, 1, 0, alpha=0.3)
+
+                    #     # Convert DOM coords to PDF coords
+                    #     dom_x = step.highlight_x
+                    #     dom_y = step.highlight_y
+                    #     dom_w = step.highlight_width
+                    #     dom_h = step.highlight_height
+                    #     print("dom_x--------"+step.highlight_x)
+
+                    #     pdf_x = img_x + dom_x
+                    #     pdf_y = (margin_top - img_height) + (img_height - dom_y - dom_h)
+
+                    #     pdf.rect(
+                    #         pdf_x,
+                    #         pdf_y,
+                    #         dom_w,
+                    #         dom_h,
+                    #         fill=1,
+                    #         stroke=0
+                    #     )
+
+                    
                 except Exception as e:
                     # Don't break PDF if image fails
                     write_line(f"  [Could not render screenshot: {e}]")
@@ -208,21 +239,22 @@ async def search_public_guides(
 @router.post("/", status_code=201, response_model=Guide)
 async def create_guide(
     guide: GuideCreate,
+    request: Request,
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
+    """
+    Create guide and save step screenshots + highlight coords.
+    Accepts nested `highlight` object in each step (payload you posted).
+    """
+    # --- basic duplicate-check
     existing_guide = (
         db.query(models.Guide)
-        .filter(
-            models.Guide.owner_id == current_user.id,
-            models.Guide.shortcut == guide.shortcut,
-        )
+        .filter(models.Guide.owner_id == current_user.id, models.Guide.shortcut == guide.shortcut)
         .first()
     )
     if existing_guide:
-        raise HTTPException(
-            status_code=400, detail="A guide with this shortcut already exists."
-        )
+        raise HTTPException(status_code=400, detail="A guide with this shortcut already exists.")
 
     try:
         db_guide = models.Guide(
@@ -232,10 +264,8 @@ async def create_guide(
             owner_id=current_user.id,
         )
         db.add(db_guide)
-        db.flush()  # get db_guide.id
+        db.flush()  # so db_guide.id is available
 
-        # Ensure root dir exists
-        SCREENSHOT_ROOT.mkdir(parents=True, exist_ok=True)
         guide_dir = SCREENSHOT_ROOT / f"guide_{db_guide.id}"
         guide_dir.mkdir(parents=True, exist_ok=True)
 
@@ -244,26 +274,79 @@ async def create_guide(
         for i, step_data in enumerate(guide.steps):
             screenshot_path_str = None
 
-            if step_data.screenshot:
+            # Save screenshot (data URL -> file)
+            raw_img = getattr(step_data, "screenshot", None)
+            if raw_img:
                 try:
-                    raw = step_data.screenshot
-                    # handle data URL "data:image/png;base64,...."
-                    if "," in raw:
-                        _, raw = raw.split(",", 1)
-                    img_bytes = base64.b64decode(raw)
+                    if "," in raw_img:
+                        _, raw_img = raw_img.split(",", 1)
+                    img_bytes = base64.b64decode(raw_img)
                     img_file = guide_dir / f"step_{i+1}.png"
                     with open(img_file, "wb") as f:
                         f.write(img_bytes)
+                    # Now open it with PIL
+                    img = Image.open(img_file).convert("RGBA")
+                    draw = ImageDraw.Draw(img, "RGBA")
+
+                    # Extract highlight coords
+                    h = getattr(step_data, "highlight", None)
+                    if h:
+                        x = float(h.x)
+                        y = float(h.y)
+                        w = float(h.width)
+                        hgt = float(h.height)
+
+                        # Draw translucent yellow rectangle
+                        draw.rectangle(
+                            [x, y, x + w, y + hgt],
+                            fill=(255, 255, 0, 80),   # 80 alpha = translucent
+                            outline=(255, 255, 0, 255),
+                            width=3
+                        )
+
+                        # Save modified screenshot (overwrite original)
+                        img.save(img_file)
                     screenshot_path_str = str(img_file)
                 except Exception as e:
-                    # Don't break guide creation if screenshot fails
-                    print("Error saving screenshot:", e)
+                    print(f"Error saving screenshot for step {i+1}: {e}")
+
+            # Extract highlights:
+            highlight_x = highlight_y = highlight_width = highlight_height = None
+
+            # Case A: nested highlight object (dict or pydantic model)
+            try:
+                if getattr(step_data, "highlight", None):
+                    h = step_data.highlight
+                    if isinstance(h, dict):
+                        highlight_x = h.get("x")
+                        highlight_y = h.get("y")
+                        highlight_width = h.get("width")
+                        highlight_height = h.get("height")
+                    else:
+                        # pydantic model
+                        highlight_x = getattr(h, "x", None)
+                        highlight_y = getattr(h, "y", None)
+                        highlight_width = getattr(h, "width", None)
+                        highlight_height = getattr(h, "height", None)
+            except Exception:
+                pass
+
+            # Case B: fallback to top-level highlight_* fields
+            if highlight_x is None:
+                highlight_x = getattr(step_data, "highlight_x", None)
+                highlight_y = getattr(step_data, "highlight_y", None)
+                highlight_width = getattr(step_data, "highlight_width", None)
+                highlight_height = getattr(step_data, "highlight_height", None)
 
             db_step = models.Step(
                 step_number=i + 1,
-                selector=step_data.selector,
-                instruction=step_data.instruction,
+                selector=getattr(step_data, "selector", None),
+                instruction=getattr(step_data, "instruction", None),
                 screenshot_path=screenshot_path_str,
+                highlight_x=highlight_x,
+                highlight_y=highlight_y,
+                highlight_width=highlight_width,
+                highlight_height=highlight_height,
                 guide_id=db_guide.id,
             )
             db.add(db_step)
@@ -287,7 +370,9 @@ async def create_guide(
 
     except Exception as e:
         db.rollback()
+        # Avoid concatenating objects with strings — format safely:
         raise HTTPException(status_code=400, detail=f"Error creating guide: {e}")
+
 
 
 # --- GET MY GUIDES ---

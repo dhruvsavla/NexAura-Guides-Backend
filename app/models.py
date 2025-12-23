@@ -1,5 +1,5 @@
 # app/models.py
-from sqlalchemy import Column, Integer, String, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, ForeignKey, Text ,Float
 from sqlalchemy.orm import relationship
 from .database import Base
 
@@ -37,6 +37,11 @@ class Step(Base):
     instruction = Column(Text, nullable=False)
     # NEW: where we store screenshot file path on disk (e.g. "guide_screenshots/guide_1/step_1.png")
     screenshot_path = Column(Text, nullable=True)
+
+    highlight_x = Column(Float, nullable=True)
+    highlight_y = Column(Float, nullable=True)
+    highlight_width = Column(Float, nullable=True)
+    highlight_height = Column(Float, nullable=True)
 
     guide_id = Column(Integer, ForeignKey("guides.id"))
     guide = relationship("Guide", back_populates="steps")
