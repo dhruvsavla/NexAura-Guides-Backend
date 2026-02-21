@@ -233,6 +233,7 @@ async def search_public_guides(
 
 
 # --- CREATE GUIDE (NOW SAVES SCREENSHOTS TO DISK) ---
+# --- CREATE GUIDE (NOW SAVES SCREENSHOTS TO DISK) ---
 @router.post("/", status_code=201, response_model=Guide)
 async def create_guide(
     guide: GuideCreate,
@@ -242,7 +243,8 @@ async def create_guide(
 ):
     """
     Create guide and save step screenshots + highlight coords.
-    Accepts nested `highlight` object in each step (payload you posted).
+    Extracts highlight coords from target.vision.bbox and uses alpha compositing
+    to ensure the highlight is transparent and text remains visible.
     """
     # --- basic duplicate-check
     existing_guide = (
@@ -270,6 +272,19 @@ async def create_guide(
 
         for i, step_data in enumerate(guide.steps):
             screenshot_path_str = None
+            
+            # --- EXTRACT HIGHLIGHTS FROM TARGET ---
+            highlight_x = highlight_y = highlight_width = highlight_height = None
+            target_data = getattr(step_data, "target", None)
+            
+            if target_data and isinstance(target_data, dict):
+                vision = target_data.get("vision", {})
+                bbox = vision.get("bbox")
+                if bbox:
+                    highlight_x = float(bbox.get("x", 0))
+                    highlight_y = float(bbox.get("y", 0))
+                    highlight_width = float(bbox.get("width", 0))
+                    highlight_height = float(bbox.get("height", 0))
 
             # Save screenshot (data URL -> file)
             raw_img = getattr(step_data, "screenshot", None)
@@ -281,60 +296,41 @@ async def create_guide(
                     img_file = guide_dir / f"step_{i+1}.png"
                     with open(img_file, "wb") as f:
                         f.write(img_bytes)
-                    # Now open it with PIL
+                        
+                    # Now open it with PIL and ensure it's RGBA
                     img = Image.open(img_file).convert("RGBA")
-                    draw = ImageDraw.Draw(img, "RGBA")
 
-                    # Extract highlight coords
-                    h = getattr(step_data, "highlight", None)
-                    if h:
-                        x = float(h.x)
-                        y = float(h.y)
-                        w = float(h.width)
-                        hgt = float(h.height)
+                    # If we successfully extracted bbox coordinates, draw the transparent highlight
+                    if highlight_x is not None and highlight_y is not None and highlight_width is not None and highlight_height is not None:
+                        
+                        # 1. CREATE A COMPLETELY TRANSPARENT OVERLAY
+                        # Must be exactly the same size and mode ("RGBA") as the base image
+                        overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
+                        draw = ImageDraw.Draw(overlay)
 
-                        # Draw translucent yellow rectangle
+                        # 2. Draw translucent yellow rectangle ON THE OVERLAY
                         draw.rectangle(
-                            [x, y, x + w, y + hgt],
-                            fill=(255, 255, 0, 80),   # 80 alpha = translucent
+                            [
+                                highlight_x, 
+                                highlight_y, 
+                                highlight_x + highlight_width, 
+                                highlight_y + highlight_height
+                            ],
+                            fill=(255, 255, 0, 80),   # 80 alpha = translucent yellow
                             outline=(255, 255, 0, 255),
-                            width=3
+                            width=4
                         )
 
-                        # Save modified screenshot (overwrite original)
-                        img.save(img_file)
+                        # 3. COMPOSITE (BLEND) THE OVERLAY OVER THE ORIGINAL IMAGE
+                        img = Image.alpha_composite(img, overlay)
+
+                    # Save modified screenshot (overwrite original)
+                    img.save(img_file, format="PNG")
                     screenshot_path_str = str(img_file)
                 except Exception as e:
                     print(f"Error saving screenshot for step {i+1}: {e}")
 
-            # Extract highlights:
-            highlight_x = highlight_y = highlight_width = highlight_height = None
-
-            # Case A: nested highlight object (dict or pydantic model)
-            try:
-                if getattr(step_data, "highlight", None):
-                    h = step_data.highlight
-                    if isinstance(h, dict):
-                        highlight_x = h.get("x")
-                        highlight_y = h.get("y")
-                        highlight_width = h.get("width")
-                        highlight_height = h.get("height")
-                    else:
-                        # pydantic model
-                        highlight_x = getattr(h, "x", None)
-                        highlight_y = getattr(h, "y", None)
-                        highlight_width = getattr(h, "width", None)
-                        highlight_height = getattr(h, "height", None)
-            except Exception:
-                pass
-
-            # Case B: fallback to top-level highlight_* fields
-            if highlight_x is None:
-                highlight_x = getattr(step_data, "highlight_x", None)
-                highlight_y = getattr(step_data, "highlight_y", None)
-                highlight_width = getattr(step_data, "highlight_width", None)
-                highlight_height = getattr(step_data, "highlight_height", None)
-
+            # Save step to DB
             db_step = models.Step(
                 step_number=i + 1,
                 selector=getattr(step_data, "selector", None),
@@ -378,13 +374,13 @@ async def create_guide(
                     step.target = payload.get("target")
         except Exception as e:
             print("Warning: failed to hydrate rich step metadata into response", e)
+            
         return db_guide
 
     except Exception as e:
         db.rollback()
         # Avoid concatenating objects with strings — format safely:
         raise HTTPException(status_code=400, detail=f"Error creating guide: {e}")
-
 
 
 # --- GET MY GUIDES ---
