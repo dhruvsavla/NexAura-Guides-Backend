@@ -9,6 +9,7 @@ import base64
 import os
 from pathlib import Path
 from PIL import Image, ImageDraw
+import re
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -321,7 +322,11 @@ async def export_guide_pdf(
     pdf.showPage()
     pdf.save()
     buffer.seek(0)
-    filename = f"guide-{guide_id}.pdf"
+    # Use guide name for download; replace spaces with underscores and strip unsafe chars
+    raw_name = (db_guide.name or f"guide-{guide_id}").strip()
+    underscored = re.sub(r"\s+", "_", raw_name)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "", underscored) or f"guide_{guide_id}"
+    filename = f"{safe_name}.pdf"
 
     return StreamingResponse(
         buffer,
