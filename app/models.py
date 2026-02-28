@@ -19,6 +19,7 @@ class Guide(Base):
     shortcut = Column(String, index=True, unique=True, nullable=False)
     description = Column(Text, nullable=False)
     is_public = Column(Boolean, default=False)
+    share_token = Column(String, unique=True, index=True, nullable=True)
     owner_id = Column(Integer, ForeignKey("users.id"))
 
     owner = relationship("User", back_populates="guides")
@@ -28,6 +29,20 @@ class Guide(Base):
         cascade="all, delete-orphan",
         order_by="Step.step_number",
     )
+    access_list = relationship(
+        "GuideAccess",
+        back_populates="guide",
+        cascade="all, delete-orphan",
+    )
+
+
+class GuideAccess(Base):
+    __tablename__ = "guide_access"
+    id = Column(Integer, primary_key=True, index=True)
+    guide_id = Column(Integer, ForeignKey("guides.id"))
+    email = Column(String, index=True, nullable=False)
+
+    guide = relationship("Guide", back_populates="access_list")
 
 
 class Step(Base):

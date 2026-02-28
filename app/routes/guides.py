@@ -10,12 +10,13 @@ import os
 from pathlib import Path
 from PIL import Image, ImageDraw
 import re
+import secrets
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 from .. import database, models, auth
-from ..schemas import GuideCreate, Guide
+from ..schemas import GuideCreate, Guide, GuideUpdate
 import json
 
 router = APIRouter()
@@ -203,8 +204,13 @@ async def export_guide_pdf(
             detail="Guide not found",
         )
 
-    # 2. Ensure user owns this guide
-    if db_guide.owner_id != current_user.id:
+    # 2. Ensure user has access (owner, shared, or public)
+    has_access = (
+        db_guide.owner_id == current_user.id or
+        db_guide.is_public or
+        any(access.email == current_user.email for access in db_guide.access_list)
+    )
+    if not has_access:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authorized to export this guide",
@@ -384,6 +390,189 @@ async def search_public_guides(
     return query.all()
 
 
+# --- ACCESS CLAIM ENDPOINT ---
+@router.post("/share/access/{share_token}", response_model=Guide)
+async def claim_guide_access(
+    share_token: str,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    db_guide = db.query(models.Guide).filter(models.Guide.share_token == share_token).first()
+    if not db_guide:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Invalid share token"
+        )
+
+    # Check if user already has access
+    already_shared = any(access.email == current_user.email for access in db_guide.access_list)
+    if not already_shared and db_guide.owner_id != current_user.id:
+        # Add access
+        access = models.GuideAccess(guide_id=db_guide.id, email=current_user.email)
+        db.add(access)
+        try:
+            db.commit()
+            db.refresh(db_guide)
+        except Exception as e:
+            db.rollback()
+            print(f"Error claiming access: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="An error occurred while claiming access",
+            )
+
+    # Hydrate steps and shared emails for response
+    db_guide.steps = hydrate_rich_steps(db_guide)
+    db_guide.shared_emails = hydrate_shared_emails(db_guide)
+
+    return db_guide
+
+
+# --- SHARE TOKEN ENDPOINT ---
+@router.post("/{guide_id}/share-token", response_model=Guide)
+async def generate_share_token(
+    guide_id: int,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    db_guide = db.query(models.Guide).filter(models.Guide.id == guide_id).first()
+    if not db_guide:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Guide not found"
+        )
+
+    if db_guide.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the owner can generate a share token",
+        )
+
+    # Generate a unique share token
+    while True:
+        token = secrets.token_urlsafe(16)
+        # Check if token already exists
+        existing = db.query(models.Guide).filter(models.Guide.share_token == token).first()
+        if not existing:
+            db_guide.share_token = token
+            break
+
+    try:
+        db.commit()
+        db.refresh(db_guide)
+
+        # Hydrate steps and shared emails for response
+        if "rich_steps_payload" in locals() and rich_steps_payload:
+            for step in db_guide.steps or []:
+                payload = rich_steps_payload.get(step.step_number) or rich_steps_payload.get(str(step.step_number))
+                if not payload:
+                    continue
+                if "action" in payload:
+                    step.action = payload.get("action")
+                if "target" in payload:
+                    step.target = payload.get("target")
+        else:
+            db_guide.steps = hydrate_rich_steps(db_guide)
+
+        db_guide.shared_emails = hydrate_shared_emails(db_guide)
+
+        return db_guide
+    except Exception as e:
+        db.rollback()
+        print(f"Error generating share token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while generating the share token",
+        )
+
+
+# --- UPDATE ENDPOINT ---
+@router.put("/{guide_id}", response_model=Guide)
+async def update_guide(
+    guide_id: int,
+    guide_update: GuideUpdate,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    db_guide = db.query(models.Guide).filter(models.Guide.id == guide_id).first()
+    if not db_guide:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Guide not found"
+        )
+
+    # Check if user has edit rights (owner or shared)
+    has_edit_access = (
+        db_guide.owner_id == current_user.id or
+        any(access.email == current_user.email for access in db_guide.access_list)
+    )
+    if not has_edit_access:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to update this guide",
+        )
+
+    if guide_update.name is not None:
+        db_guide.name = guide_update.name
+    if guide_update.shortcut is not None:
+        # Check if shortcut is already taken by ANY guide
+        existing = db.query(models.Guide).filter(
+            models.Guide.shortcut == guide_update.shortcut,
+            models.Guide.id != guide_id
+        ).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Shortcut already exists globally")
+        db_guide.shortcut = guide_update.shortcut
+    if guide_update.description is not None:
+        db_guide.description = guide_update.description
+    if guide_update.is_public is not None:
+        # Only owner can change public status
+        if db_guide.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the owner can modify public status",
+            )
+        db_guide.is_public = guide_update.is_public
+
+    if guide_update.shared_emails is not None:
+        # Only owner can change sharing settings
+        if db_guide.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the owner can modify sharing settings",
+            )
+        set_guide_access(db, guide_id, guide_update.shared_emails)
+
+    rich_steps_payload = None
+    if guide_update.steps is not None:
+        rich_steps_payload = process_steps_and_save_screenshots(db, db_guide, guide_update.steps)
+
+    try:
+        db.commit()
+        db.refresh(db_guide)
+
+        # Hydrate steps and shared emails for response
+        if "rich_steps_payload" in locals() and rich_steps_payload:
+            for step in db_guide.steps or []:
+                payload = rich_steps_payload.get(step.step_number) or rich_steps_payload.get(str(step.step_number))
+                if not payload:
+                    continue
+                if "action" in payload:
+                    step.action = payload.get("action")
+                if "target" in payload:
+                    step.target = payload.get("target")
+        else:
+            db_guide.steps = hydrate_rich_steps(db_guide)
+
+        db_guide.shared_emails = hydrate_shared_emails(db_guide)
+
+        return db_guide
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating guide: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while updating the guide",
+        )
+
+
 # --- CREATE GUIDE (NOW SAVES SCREENSHOTS TO DISK) ---
 @router.post("/", status_code=201, response_model=Guide)
 async def create_guide(
@@ -417,87 +606,14 @@ async def create_guide(
         db.add(db_guide)
         db.flush()  # so db_guide.id is available
 
-        guide_dir = SCREENSHOT_ROOT / f"guide_{db_guide.id}"
-        guide_dir.mkdir(parents=True, exist_ok=True)
+        rich_steps_payload = process_steps_and_save_screenshots(db, db_guide, guide.steps)
 
-        rich_steps_payload: Dict[int, Dict[str, Any]] = {}
-
-        for i, step_data in enumerate(guide.steps):
-            screenshot_path_str = None
-            
-            # Extract bbox from target.vision
-            bbox = None
-            target_data = getattr(step_data, "target", None)
-            
-            if target_data and isinstance(target_data, dict):
-                vision = target_data.get("vision", {})
-                bbox = vision.get("bbox")
-            
-            # Save screenshot and draw highlight
-            raw_img = getattr(step_data, "screenshot", None)
-            if raw_img:
-                try:
-                    if "," in raw_img:
-                        _, raw_img = raw_img.split(",", 1)
-                    img_bytes = base64.b64decode(raw_img)
-                    img_file = guide_dir / f"step_{i+1}.png"
-                    
-                    # Save original first
-                    with open(img_file, "wb") as f:
-                        f.write(img_bytes)
-                    
-                    # Open and process
-                    img = Image.open(img_file).convert("RGBA")
-                    print(f"[NexAura] Step {i+1}: Image size = {img.size}")
-                    
-                    if bbox:
-                        print(f"[NexAura] Step {i+1}: Original bbox = {bbox}")
-                        img = draw_highlight_on_image(img, bbox)
-                    
-                    # Save with highlight
-                    img.save(img_file, format="PNG")
-                    screenshot_path_str = str(img_file)
-                    
-                except Exception as e:
-                    print(f"[NexAura] Error processing screenshot for step {i+1}: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-            # Extract coordinates for DB storage (store original, not scaled)
-            highlight_x = float(bbox.get('x', 0)) if bbox else None
-            highlight_y = float(bbox.get('y', 0)) if bbox else None
-            highlight_width = float(bbox.get('width', 0)) if bbox else None
-            highlight_height = float(bbox.get('height', 0)) if bbox else None
-
-            # Save step to DB
-            db_step = models.Step(
-                step_number=i + 1,
-                selector=getattr(step_data, "selector", None),
-                instruction=getattr(step_data, "instruction", None),
-                screenshot_path=screenshot_path_str,
-                highlight_x=highlight_x,
-                highlight_y=highlight_y,
-                highlight_width=highlight_width,
-                highlight_height=highlight_height,
-                guide_id=db_guide.id,
-            )
-            db.add(db_step)
-
-            rich_steps_payload[i + 1] = {
-                "action": step_data.action or None,
-                "target": step_data.target or None,
-            }
+        # Set guide access
+        if guide.shared_emails:
+            set_guide_access(db, db_guide.id, guide.shared_emails)
 
         db.commit()
         db.refresh(db_guide)
-
-        # Persist rich step metadata
-        try:
-            rich_file = guide_dir / "rich_steps.json"
-            with open(rich_file, "w", encoding="utf-8") as f:
-                json.dump(rich_steps_payload, f)
-        except Exception as e:
-            print("[NexAura] Warning: failed to persist rich step metadata", e)
 
         # Hydrate rich fields
         try:
@@ -511,6 +627,9 @@ async def create_guide(
                     step.target = payload.get("target")
         except Exception as e:
             print("[NexAura] Warning: failed to hydrate rich step metadata", e)
+
+        # Hydrate shared emails for response
+        db_guide.shared_emails = hydrate_shared_emails(db_guide)
             
         return db_guide
 
@@ -527,17 +646,26 @@ async def get_user_guides(
     current_user: models.User = Depends(auth.get_current_user),
 ):
     print(f"Fetching guides for user_id={current_user.id}")
-    user = (
-        db.query(models.User)
-        .filter(models.User.id == current_user.id)
-        .first()
+    # Return guides owned by the user OR shared with their email
+    guides = (
+        db.query(models.Guide)
+        .outerjoin(models.GuideAccess)
+        .filter(
+            or_(
+                models.Guide.owner_id == current_user.id,
+                models.GuideAccess.email == current_user.email
+            )
+        )
+        .distinct()
+        .all()
     )
-    guides = user.guides if user else []
+
     for g in guides:
         try:
             enriched = hydrate_rich_steps(g)
             if enriched:
                 g.steps = enriched
+            g.shared_emails = hydrate_shared_emails(g)
         except Exception:
             continue
     print("guides--------"+str(guides))
@@ -549,11 +677,18 @@ async def get_guide_by_shortcut(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
-    # Query database directly for the specific guide belonging to this user
+    # Query database for the specific guide (owner, shared, or public)
     guide = (
         db.query(models.Guide)
-        .filter(models.Guide.owner_id == current_user.id)
+        .outerjoin(models.GuideAccess)
         .filter(models.Guide.shortcut == shortcut)
+        .filter(
+            or_(
+                models.Guide.owner_id == current_user.id,
+                models.GuideAccess.email == current_user.email,
+                models.Guide.is_public == True
+            )
+        )
         .first()
     )
 
@@ -566,11 +701,107 @@ async def get_guide_by_shortcut(
         enriched = hydrate_rich_steps(guide)
         if enriched:
             guide.steps = enriched
+        guide.shared_emails = hydrate_shared_emails(guide)
     except Exception as e:
         print(f"Error hydrating steps for specific guide: {e}")
 
     return guide
 
+
+def set_guide_access(db: Session, guide_id: int, emails: List[str]):
+    # Remove existing access
+    db.query(models.GuideAccess).filter(models.GuideAccess.guide_id == guide_id).delete()
+
+    # Add new access records
+    for email in emails:
+        access = models.GuideAccess(guide_id=guide_id, email=email)
+        db.add(access)
+
+def process_steps_and_save_screenshots(db: Session, db_guide: models.Guide, steps_data: List[Any]):
+    # 1. Clear existing steps
+    db.query(models.Step).filter(models.Step.guide_id == db_guide.id).delete()
+
+    guide_dir = SCREENSHOT_ROOT / f"guide_{db_guide.id}"
+    guide_dir.mkdir(parents=True, exist_ok=True)
+
+    rich_steps_payload: Dict[int, Dict[str, Any]] = {}
+
+    for i, step_data in enumerate(steps_data):
+        screenshot_path_str = None
+
+        # Extract bbox from target.vision
+        bbox = None
+        target_data = getattr(step_data, "target", None)
+
+        if target_data and isinstance(target_data, dict):
+            vision = target_data.get("vision", {})
+            bbox = vision.get("bbox")
+
+        # Save screenshot and draw highlight
+        raw_img = getattr(step_data, "screenshot", None)
+        if raw_img:
+            try:
+                if "," in raw_img:
+                    _, raw_img = raw_img.split(",", 1)
+                img_bytes = base64.b64decode(raw_img)
+                img_file = guide_dir / f"step_{i+1}.png"
+
+                # Save original first
+                with open(img_file, "wb") as f:
+                    f.write(img_bytes)
+
+                # Open and process
+                img = Image.open(img_file).convert("RGBA")
+
+                if bbox:
+                    img = draw_highlight_on_image(img, bbox)
+
+                # Save with highlight
+                img.save(img_file, format="PNG")
+                screenshot_path_str = str(img_file)
+
+            except Exception as e:
+                print(f"[NexAura] Error processing screenshot for step {i+1}: {e}")
+
+        # Extract coordinates for DB storage
+        highlight_x = float(bbox.get('x', 0)) if bbox else None
+        highlight_y = float(bbox.get('y', 0)) if bbox else None
+        highlight_width = float(bbox.get('width', 0)) if bbox else None
+        highlight_height = float(bbox.get('height', 0)) if bbox else None
+
+        # Save step to DB
+        db_step = models.Step(
+            step_number=i + 1,
+            selector=getattr(step_data, "selector", None),
+            instruction=getattr(step_data, "instruction", None),
+            screenshot_path=screenshot_path_str,
+            highlight_x=highlight_x,
+            highlight_y=highlight_y,
+            highlight_width=highlight_width,
+            highlight_height=highlight_height,
+            guide_id=db_guide.id,
+        )
+        db.add(db_step)
+
+        rich_steps_payload[i + 1] = {
+            "action": step_data.action or None,
+            "target": step_data.target or None,
+        }
+
+    # Persist rich step metadata
+    try:
+        rich_file = guide_dir / "rich_steps.json"
+        with open(rich_file, "w", encoding="utf-8") as f:
+            json.dump(rich_steps_payload, f)
+    except Exception as e:
+        print("[NexAura] Warning: failed to persist rich step metadata", e)
+
+    return rich_steps_payload
+
+def hydrate_shared_emails(guide: models.Guide):
+    if not guide:
+        return []
+    return [access.email for access in guide.access_list]
 
 def hydrate_rich_steps(guide: models.Guide):
     if not guide or not guide.id:
