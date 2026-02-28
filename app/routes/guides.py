@@ -460,7 +460,18 @@ async def generate_share_token(
         db.refresh(db_guide)
 
         # Hydrate steps and shared emails for response
-        db_guide.steps = hydrate_rich_steps(db_guide)
+        if "rich_steps_payload" in locals() and rich_steps_payload:
+            for step in db_guide.steps or []:
+                payload = rich_steps_payload.get(step.step_number) or rich_steps_payload.get(str(step.step_number))
+                if not payload:
+                    continue
+                if "action" in payload:
+                    step.action = payload.get("action")
+                if "target" in payload:
+                    step.target = payload.get("target")
+        else:
+            db_guide.steps = hydrate_rich_steps(db_guide)
+
         db_guide.shared_emails = hydrate_shared_emails(db_guide)
 
         return db_guide
@@ -529,12 +540,27 @@ async def update_guide(
             )
         set_guide_access(db, guide_id, guide_update.shared_emails)
 
+    rich_steps_payload = None
+    if guide_update.steps is not None:
+        rich_steps_payload = process_steps_and_save_screenshots(db, db_guide, guide_update.steps)
+
     try:
         db.commit()
         db.refresh(db_guide)
 
         # Hydrate steps and shared emails for response
-        db_guide.steps = hydrate_rich_steps(db_guide)
+        if "rich_steps_payload" in locals() and rich_steps_payload:
+            for step in db_guide.steps or []:
+                payload = rich_steps_payload.get(step.step_number) or rich_steps_payload.get(str(step.step_number))
+                if not payload:
+                    continue
+                if "action" in payload:
+                    step.action = payload.get("action")
+                if "target" in payload:
+                    step.target = payload.get("target")
+        else:
+            db_guide.steps = hydrate_rich_steps(db_guide)
+
         db_guide.shared_emails = hydrate_shared_emails(db_guide)
 
         return db_guide
@@ -580,93 +606,14 @@ async def create_guide(
         db.add(db_guide)
         db.flush()  # so db_guide.id is available
 
-        guide_dir = SCREENSHOT_ROOT / f"guide_{db_guide.id}"
-        guide_dir.mkdir(parents=True, exist_ok=True)
-
-        rich_steps_payload: Dict[int, Dict[str, Any]] = {}
-
-        for i, step_data in enumerate(guide.steps):
-            screenshot_path_str = None
-            
-            # Extract bbox from target.vision
-            bbox = None
-            target_data = getattr(step_data, "target", None)
-            
-            if target_data and isinstance(target_data, dict):
-                vision = target_data.get("vision", {})
-                bbox = vision.get("bbox")
-            
-            # Save screenshot and draw highlight
-            raw_img = getattr(step_data, "screenshot", None)
-            if raw_img:
-                try:
-                    if "," in raw_img:
-                        _, raw_img = raw_img.split(",", 1)
-                    img_bytes = base64.b64decode(raw_img)
-                    img_file = guide_dir / f"step_{i+1}.png"
-                    
-                    # Save original first
-                    with open(img_file, "wb") as f:
-                        f.write(img_bytes)
-                    
-                    # Open and process
-                    img = Image.open(img_file).convert("RGBA")
-                    print(f"[NexAura] Step {i+1}: Image size = {img.size}")
-                    
-                    if bbox:
-                        print(f"[NexAura] Step {i+1}: Original bbox = {bbox}")
-                        img = draw_highlight_on_image(img, bbox)
-                    
-                    # Save with highlight
-                    img.save(img_file, format="PNG")
-                    screenshot_path_str = str(img_file)
-                    
-                except Exception as e:
-                    print(f"[NexAura] Error processing screenshot for step {i+1}: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-            # Extract coordinates for DB storage (store original, not scaled)
-            highlight_x = float(bbox.get('x', 0)) if bbox else None
-            highlight_y = float(bbox.get('y', 0)) if bbox else None
-            highlight_width = float(bbox.get('width', 0)) if bbox else None
-            highlight_height = float(bbox.get('height', 0)) if bbox else None
-
-            # Save step to DB
-            db_step = models.Step(
-                step_number=i + 1,
-                selector=getattr(step_data, "selector", None),
-                instruction=getattr(step_data, "instruction", None),
-                screenshot_path=screenshot_path_str,
-                highlight_x=highlight_x,
-                highlight_y=highlight_y,
-                highlight_width=highlight_width,
-                highlight_height=highlight_height,
-                guide_id=db_guide.id,
-            )
-            db.add(db_step)
-
-            rich_steps_payload[i + 1] = {
-                "action": step_data.action or None,
-                "target": step_data.target or None,
-            }
-
-        db.commit()
-        db.refresh(db_guide)
+        rich_steps_payload = process_steps_and_save_screenshots(db, db_guide, guide.steps)
 
         # Set guide access
         if guide.shared_emails:
             set_guide_access(db, db_guide.id, guide.shared_emails)
-            db.commit()
-            db.refresh(db_guide)
 
-        # Persist rich step metadata
-        try:
-            rich_file = guide_dir / "rich_steps.json"
-            with open(rich_file, "w", encoding="utf-8") as f:
-                json.dump(rich_steps_payload, f)
-        except Exception as e:
-            print("[NexAura] Warning: failed to persist rich step metadata", e)
+        db.commit()
+        db.refresh(db_guide)
 
         # Hydrate rich fields
         try:
@@ -769,6 +716,87 @@ def set_guide_access(db: Session, guide_id: int, emails: List[str]):
     for email in emails:
         access = models.GuideAccess(guide_id=guide_id, email=email)
         db.add(access)
+
+def process_steps_and_save_screenshots(db: Session, db_guide: models.Guide, steps_data: List[Any]):
+    # 1. Clear existing steps
+    db.query(models.Step).filter(models.Step.guide_id == db_guide.id).delete()
+
+    guide_dir = SCREENSHOT_ROOT / f"guide_{db_guide.id}"
+    guide_dir.mkdir(parents=True, exist_ok=True)
+
+    rich_steps_payload: Dict[int, Dict[str, Any]] = {}
+
+    for i, step_data in enumerate(steps_data):
+        screenshot_path_str = None
+
+        # Extract bbox from target.vision
+        bbox = None
+        target_data = getattr(step_data, "target", None)
+
+        if target_data and isinstance(target_data, dict):
+            vision = target_data.get("vision", {})
+            bbox = vision.get("bbox")
+
+        # Save screenshot and draw highlight
+        raw_img = getattr(step_data, "screenshot", None)
+        if raw_img:
+            try:
+                if "," in raw_img:
+                    _, raw_img = raw_img.split(",", 1)
+                img_bytes = base64.b64decode(raw_img)
+                img_file = guide_dir / f"step_{i+1}.png"
+
+                # Save original first
+                with open(img_file, "wb") as f:
+                    f.write(img_bytes)
+
+                # Open and process
+                img = Image.open(img_file).convert("RGBA")
+
+                if bbox:
+                    img = draw_highlight_on_image(img, bbox)
+
+                # Save with highlight
+                img.save(img_file, format="PNG")
+                screenshot_path_str = str(img_file)
+
+            except Exception as e:
+                print(f"[NexAura] Error processing screenshot for step {i+1}: {e}")
+
+        # Extract coordinates for DB storage
+        highlight_x = float(bbox.get('x', 0)) if bbox else None
+        highlight_y = float(bbox.get('y', 0)) if bbox else None
+        highlight_width = float(bbox.get('width', 0)) if bbox else None
+        highlight_height = float(bbox.get('height', 0)) if bbox else None
+
+        # Save step to DB
+        db_step = models.Step(
+            step_number=i + 1,
+            selector=getattr(step_data, "selector", None),
+            instruction=getattr(step_data, "instruction", None),
+            screenshot_path=screenshot_path_str,
+            highlight_x=highlight_x,
+            highlight_y=highlight_y,
+            highlight_width=highlight_width,
+            highlight_height=highlight_height,
+            guide_id=db_guide.id,
+        )
+        db.add(db_step)
+
+        rich_steps_payload[i + 1] = {
+            "action": step_data.action or None,
+            "target": step_data.target or None,
+        }
+
+    # Persist rich step metadata
+    try:
+        rich_file = guide_dir / "rich_steps.json"
+        with open(rich_file, "w", encoding="utf-8") as f:
+            json.dump(rich_steps_payload, f)
+    except Exception as e:
+        print("[NexAura] Warning: failed to persist rich step metadata", e)
+
+    return rich_steps_payload
 
 def hydrate_shared_emails(guide: models.Guide):
     if not guide:

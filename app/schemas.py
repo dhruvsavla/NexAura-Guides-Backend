@@ -81,6 +81,7 @@ class GuideUpdate(BaseModel):
     description: Optional[str] = None
     is_public: Optional[bool] = None
     shared_emails: Optional[List[str]] = None
+    steps: Optional[List[StepCreate]] = None
 
 class Guide(GuideBase):
     id: int
