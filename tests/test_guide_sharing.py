@@ -174,3 +174,48 @@ def test_unauthorized_access_prevented(client):
     # Other user should NOT be able to export
     resp = client.get(f"/api/guides/{guide_id}/export-pdf", headers={"Authorization": f"Bearer {other_token}"})
     assert resp.status_code == 403
+
+def test_share_link_functionality(client):
+    owner_email = "owner_link@example.com"
+    claimant_email = "claimant@example.com"
+    password = "password123"
+
+    owner_token = get_token(client, owner_email, password)
+    claimant_token = get_token(client, claimant_email, password)
+
+    # 1. Create guide
+    resp = client.post(
+        "/api/guides/",
+        json={
+            "name": "Link Guide",
+            "shortcut": "link1",
+            "description": "Shareable",
+            "is_public": False,
+            "steps": [{"instruction": "Step 1", "selector": "body"}]
+        },
+        headers={"Authorization": f"Bearer {owner_token}"}
+    )
+    guide_id = resp.json()["id"]
+
+    # 2. Generate share token
+    resp = client.post(f"/api/guides/{guide_id}/share-token", headers={"Authorization": f"Bearer {owner_token}"})
+    assert resp.status_code == 200
+    share_token = resp.json()["share_token"]
+    assert share_token is not None
+
+    # 3. Claimant should NOT have access yet
+    resp = client.get("/api/guides/", headers={"Authorization": f"Bearer {claimant_token}"})
+    assert not any(g["id"] == guide_id for g in resp.json())
+
+    # 4. Claimant uses share link to get access
+    resp = client.post(f"/api/guides/share/access/{share_token}", headers={"Authorization": f"Bearer {claimant_token}"})
+    assert resp.status_code == 200
+    assert claimant_email in resp.json()["shared_emails"]
+
+    # 5. Claimant should NOW have access
+    resp = client.get("/api/guides/", headers={"Authorization": f"Bearer {claimant_token}"})
+    assert any(g["id"] == guide_id for g in resp.json())
+
+    # 6. Invalid token should return 404
+    resp = client.post("/api/guides/share/access/invalid_token", headers={"Authorization": f"Bearer {claimant_token}"})
+    assert resp.status_code == 404

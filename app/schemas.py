@@ -88,6 +88,7 @@ class Guide(GuideBase):
     shortcut: str
     description: Optional[str] = None
     is_public: bool = False
+    share_token: Optional[str] = None
     steps: List[Step] = []
     shared_emails: List[str] = []
 

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from PIL import Image, ImageDraw
 import re
+import secrets
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -389,6 +390,89 @@ async def search_public_guides(
     return query.all()
 
 
+# --- ACCESS CLAIM ENDPOINT ---
+@router.post("/share/access/{share_token}", response_model=Guide)
+async def claim_guide_access(
+    share_token: str,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    db_guide = db.query(models.Guide).filter(models.Guide.share_token == share_token).first()
+    if not db_guide:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Invalid share token"
+        )
+
+    # Check if user already has access
+    already_shared = any(access.email == current_user.email for access in db_guide.access_list)
+    if not already_shared and db_guide.owner_id != current_user.id:
+        # Add access
+        access = models.GuideAccess(guide_id=db_guide.id, email=current_user.email)
+        db.add(access)
+        try:
+            db.commit()
+            db.refresh(db_guide)
+        except Exception as e:
+            db.rollback()
+            print(f"Error claiming access: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="An error occurred while claiming access",
+            )
+
+    # Hydrate steps and shared emails for response
+    db_guide.steps = hydrate_rich_steps(db_guide)
+    db_guide.shared_emails = hydrate_shared_emails(db_guide)
+
+    return db_guide
+
+
+# --- SHARE TOKEN ENDPOINT ---
+@router.post("/{guide_id}/share-token", response_model=Guide)
+async def generate_share_token(
+    guide_id: int,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    db_guide = db.query(models.Guide).filter(models.Guide.id == guide_id).first()
+    if not db_guide:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Guide not found"
+        )
+
+    if db_guide.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the owner can generate a share token",
+        )
+
+    # Generate a unique share token
+    while True:
+        token = secrets.token_urlsafe(16)
+        # Check if token already exists
+        existing = db.query(models.Guide).filter(models.Guide.share_token == token).first()
+        if not existing:
+            db_guide.share_token = token
+            break
+
+    try:
+        db.commit()
+        db.refresh(db_guide)
+
+        # Hydrate steps and shared emails for response
+        db_guide.steps = hydrate_rich_steps(db_guide)
+        db_guide.shared_emails = hydrate_shared_emails(db_guide)
+
+        return db_guide
+    except Exception as e:
+        db.rollback()
+        print(f"Error generating share token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while generating the share token",
+        )
+
+
 # --- UPDATE ENDPOINT ---
 @router.put("/{guide_id}", response_model=Guide)
 async def update_guide(
@@ -417,18 +501,23 @@ async def update_guide(
     if guide_update.name is not None:
         db_guide.name = guide_update.name
     if guide_update.shortcut is not None:
-        # Check if shortcut is already taken by another guide of the same user
+        # Check if shortcut is already taken by ANY guide
         existing = db.query(models.Guide).filter(
-            models.Guide.owner_id == current_user.id,
             models.Guide.shortcut == guide_update.shortcut,
             models.Guide.id != guide_id
         ).first()
         if existing:
-            raise HTTPException(status_code=400, detail="Shortcut already exists")
+            raise HTTPException(status_code=400, detail="Shortcut already exists globally")
         db_guide.shortcut = guide_update.shortcut
     if guide_update.description is not None:
         db_guide.description = guide_update.description
     if guide_update.is_public is not None:
+        # Only owner can change public status
+        if db_guide.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the owner can modify public status",
+            )
         db_guide.is_public = guide_update.is_public
 
     if guide_update.shared_emails is not None:

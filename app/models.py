@@ -19,6 +19,7 @@ class Guide(Base):
     shortcut = Column(String, index=True, unique=True, nullable=False)
     description = Column(Text, nullable=False)
     is_public = Column(Boolean, default=False)
+    share_token = Column(String, unique=True, index=True, nullable=True)
     owner_id = Column(Integer, ForeignKey("users.id"))
 
     owner = relationship("User", back_populates="guides")
