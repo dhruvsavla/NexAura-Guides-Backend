@@ -73,6 +73,14 @@ class GuideCreate(GuideBase):
     description: Optional[str] = None
     is_public: bool = False
     steps: List[StepCreate] = []
+    shared_emails: List[str] = []
+
+class GuideUpdate(BaseModel):
+    name: Optional[str] = None
+    shortcut: Optional[str] = None
+    description: Optional[str] = None
+    is_public: Optional[bool] = None
+    shared_emails: Optional[List[str]] = None
 
 class Guide(GuideBase):
     id: int
@@ -81,6 +89,7 @@ class Guide(GuideBase):
     description: Optional[str] = None
     is_public: bool = False
     steps: List[Step] = []
+    shared_emails: List[str] = []
 
     class Config:
         from_attributes = True

@@ -28,6 +28,20 @@ class Guide(Base):
         cascade="all, delete-orphan",
         order_by="Step.step_number",
     )
+    access_list = relationship(
+        "GuideAccess",
+        back_populates="guide",
+        cascade="all, delete-orphan",
+    )
+
+
+class GuideAccess(Base):
+    __tablename__ = "guide_access"
+    id = Column(Integer, primary_key=True, index=True)
+    guide_id = Column(Integer, ForeignKey("guides.id"))
+    email = Column(String, index=True, nullable=False)
+
+    guide = relationship("Guide", back_populates="access_list")
 
 
 class Step(Base):

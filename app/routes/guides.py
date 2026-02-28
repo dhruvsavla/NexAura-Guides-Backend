@@ -15,7 +15,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 from .. import database, models, auth
-from ..schemas import GuideCreate, Guide
+from ..schemas import GuideCreate, Guide, GuideUpdate
 import json
 
 router = APIRouter()
@@ -203,8 +203,13 @@ async def export_guide_pdf(
             detail="Guide not found",
         )
 
-    # 2. Ensure user owns this guide
-    if db_guide.owner_id != current_user.id:
+    # 2. Ensure user has access (owner, shared, or public)
+    has_access = (
+        db_guide.owner_id == current_user.id or
+        db_guide.is_public or
+        any(access.email == current_user.email for access in db_guide.access_list)
+    )
+    if not has_access:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authorized to export this guide",
@@ -384,6 +389,75 @@ async def search_public_guides(
     return query.all()
 
 
+# --- UPDATE ENDPOINT ---
+@router.put("/{guide_id}", response_model=Guide)
+async def update_guide(
+    guide_id: int,
+    guide_update: GuideUpdate,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    db_guide = db.query(models.Guide).filter(models.Guide.id == guide_id).first()
+    if not db_guide:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Guide not found"
+        )
+
+    # Check if user has edit rights (owner or shared)
+    has_edit_access = (
+        db_guide.owner_id == current_user.id or
+        any(access.email == current_user.email for access in db_guide.access_list)
+    )
+    if not has_edit_access:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to update this guide",
+        )
+
+    if guide_update.name is not None:
+        db_guide.name = guide_update.name
+    if guide_update.shortcut is not None:
+        # Check if shortcut is already taken by another guide of the same user
+        existing = db.query(models.Guide).filter(
+            models.Guide.owner_id == current_user.id,
+            models.Guide.shortcut == guide_update.shortcut,
+            models.Guide.id != guide_id
+        ).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Shortcut already exists")
+        db_guide.shortcut = guide_update.shortcut
+    if guide_update.description is not None:
+        db_guide.description = guide_update.description
+    if guide_update.is_public is not None:
+        db_guide.is_public = guide_update.is_public
+
+    if guide_update.shared_emails is not None:
+        # Only owner can change sharing settings
+        if db_guide.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the owner can modify sharing settings",
+            )
+        set_guide_access(db, guide_id, guide_update.shared_emails)
+
+    try:
+        db.commit()
+        db.refresh(db_guide)
+
+        # Hydrate steps and shared emails for response
+        db_guide.steps = hydrate_rich_steps(db_guide)
+        db_guide.shared_emails = hydrate_shared_emails(db_guide)
+
+        return db_guide
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating guide: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while updating the guide",
+        )
+
+
 # --- CREATE GUIDE (NOW SAVES SCREENSHOTS TO DISK) ---
 @router.post("/", status_code=201, response_model=Guide)
 async def create_guide(
@@ -491,6 +565,12 @@ async def create_guide(
         db.commit()
         db.refresh(db_guide)
 
+        # Set guide access
+        if guide.shared_emails:
+            set_guide_access(db, db_guide.id, guide.shared_emails)
+            db.commit()
+            db.refresh(db_guide)
+
         # Persist rich step metadata
         try:
             rich_file = guide_dir / "rich_steps.json"
@@ -511,6 +591,9 @@ async def create_guide(
                     step.target = payload.get("target")
         except Exception as e:
             print("[NexAura] Warning: failed to hydrate rich step metadata", e)
+
+        # Hydrate shared emails for response
+        db_guide.shared_emails = hydrate_shared_emails(db_guide)
             
         return db_guide
 
@@ -527,17 +610,26 @@ async def get_user_guides(
     current_user: models.User = Depends(auth.get_current_user),
 ):
     print(f"Fetching guides for user_id={current_user.id}")
-    user = (
-        db.query(models.User)
-        .filter(models.User.id == current_user.id)
-        .first()
+    # Return guides owned by the user OR shared with their email
+    guides = (
+        db.query(models.Guide)
+        .outerjoin(models.GuideAccess)
+        .filter(
+            or_(
+                models.Guide.owner_id == current_user.id,
+                models.GuideAccess.email == current_user.email
+            )
+        )
+        .distinct()
+        .all()
     )
-    guides = user.guides if user else []
+
     for g in guides:
         try:
             enriched = hydrate_rich_steps(g)
             if enriched:
                 g.steps = enriched
+            g.shared_emails = hydrate_shared_emails(g)
         except Exception:
             continue
     print("guides--------"+str(guides))
@@ -549,11 +641,18 @@ async def get_guide_by_shortcut(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
-    # Query database directly for the specific guide belonging to this user
+    # Query database for the specific guide (owner, shared, or public)
     guide = (
         db.query(models.Guide)
-        .filter(models.Guide.owner_id == current_user.id)
+        .outerjoin(models.GuideAccess)
         .filter(models.Guide.shortcut == shortcut)
+        .filter(
+            or_(
+                models.Guide.owner_id == current_user.id,
+                models.GuideAccess.email == current_user.email,
+                models.Guide.is_public == True
+            )
+        )
         .first()
     )
 
@@ -566,11 +665,26 @@ async def get_guide_by_shortcut(
         enriched = hydrate_rich_steps(guide)
         if enriched:
             guide.steps = enriched
+        guide.shared_emails = hydrate_shared_emails(guide)
     except Exception as e:
         print(f"Error hydrating steps for specific guide: {e}")
 
     return guide
 
+
+def set_guide_access(db: Session, guide_id: int, emails: List[str]):
+    # Remove existing access
+    db.query(models.GuideAccess).filter(models.GuideAccess.guide_id == guide_id).delete()
+
+    # Add new access records
+    for email in emails:
+        access = models.GuideAccess(guide_id=guide_id, email=email)
+        db.add(access)
+
+def hydrate_shared_emails(guide: models.Guide):
+    if not guide:
+        return []
+    return [access.email for access in guide.access_list]
 
 def hydrate_rich_steps(guide: models.Guide):
     if not guide or not guide.id:
