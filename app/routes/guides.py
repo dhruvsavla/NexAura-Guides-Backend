@@ -447,42 +447,45 @@ async def generate_share_token(
         )
 
     # Generate a unique share token
-    while True:
-        token = secrets.token_urlsafe(16)
-        # Check if token already exists
-        existing = db.query(models.Guide).filter(models.Guide.share_token == token).first()
-        if not existing:
-            db_guide.share_token = token
-            break
+    if not db_guide.share_token:
+        while True:
+            token = secrets.token_urlsafe(16)
+            # Check if token already exists
+            existing = db.query(models.Guide).filter(models.Guide.share_token == token).first()
+            if not existing:
+                db_guide.share_token = token
+                break
 
-    try:
-        db.commit()
-        db.refresh(db_guide)
+        try:
+            db.commit()
+            db.refresh(db_guide)
+        except Exception as e:
+            db.rollback()
+            print(f"Error generating share token: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to generate share token",
+            )
 
-        # Hydrate steps and shared emails for response
-        if "rich_steps_payload" in locals() and rich_steps_payload:
-            for step in db_guide.steps or []:
-                payload = rich_steps_payload.get(step.step_number) or rich_steps_payload.get(str(step.step_number))
-                if not payload:
-                    continue
-                if "action" in payload:
-                    step.action = payload.get("action")
-                if "target" in payload:
-                    step.target = payload.get("target")
-        else:
-            db_guide.steps = hydrate_rich_steps(db_guide)
+            # Hydrate steps and shared emails for response
+            # if "rich_steps_payload" in locals() and rich_steps_payload:
+            #     for step in db_guide.steps or []:
+            #         payload = rich_steps_payload.get(step.step_number) or rich_steps_payload.get(str(step.step_number))
+            #         if not payload:
+            #             continue
+            #         if "action" in payload:
+            #             step.action = payload.get("action")
+            #         if "target" in payload:
+            #             step.target = payload.get("target")
+            # else:
+            #     db_guide.steps = hydrate_rich_steps(db_guide)
 
-        db_guide.shared_emails = hydrate_shared_emails(db_guide)
+            # db_guide.shared_emails = hydrate_shared_emails(db_guide)
+    db_guide.steps = hydrate_rich_steps(db_guide)
+    db_guide.shared_emails = hydrate_shared_emails(db_guide)
+    db_guide.is_owner = (db_guide.owner_id == current_user.id)
 
-        return db_guide
-    except Exception as e:
-        db.rollback()
-        print(f"Error generating share token: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An error occurred while generating the share token",
-        )
-
+    return db_guide
 
 # --- UPDATE ENDPOINT ---
 @router.put("/{guide_id}", response_model=Guide)
