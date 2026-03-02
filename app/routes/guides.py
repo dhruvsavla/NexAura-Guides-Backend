@@ -595,6 +595,7 @@ async def create_guide(
     if existing_guide:
         raise HTTPException(status_code=400, detail="A guide with this shortcut already exists.")
 
+    print("Guide is public or private? "+str(guide.is_public))
     try:
         db_guide = models.Guide(
             name=guide.name,
@@ -645,7 +646,7 @@ async def get_user_guides(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
-    print(f"Fetching guides for user_id={current_user.id}")
+    print(f"Fetching guides for user_id={current_user.email}")
     # Return guides owned by the user OR shared with their email
     guides = (
         db.query(models.Guide)
@@ -666,9 +667,9 @@ async def get_user_guides(
             if enriched:
                 g.steps = enriched
             g.shared_emails = hydrate_shared_emails(g)
+            g.is_owner = (g.owner_id == current_user.id)
         except Exception:
             continue
-    print("guides--------"+str(guides))
     return guides
 
 @router.get("/search", response_model=Guide)
@@ -678,6 +679,7 @@ async def get_guide_by_shortcut(
     current_user: models.User = Depends(auth.get_current_user),
 ):
     # Query database for the specific guide (owner, shared, or public)
+    print("Current user:"+str(current_user.email))
     guide = (
         db.query(models.Guide)
         .outerjoin(models.GuideAccess)

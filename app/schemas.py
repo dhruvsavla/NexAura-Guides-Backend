@@ -89,6 +89,7 @@ class Guide(GuideBase):
     share_token: Optional[str] = None
     steps: List[Step] = []
     shared_emails: List[str] = []
+    is_owner: bool = False
 
     class Config:
         from_attributes = True
