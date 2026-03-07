@@ -9,9 +9,10 @@ import os
 import hashlib
 import bcrypt
 from . import models, database
+from config import settings
 
 # --- Config ---
-SECRET_KEY = os.getenv("SECRET_KEY")
+SECRET_KEY = settings.secret_key
 if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY environment variable is not set")
 ALGORITHM = "HS256"
